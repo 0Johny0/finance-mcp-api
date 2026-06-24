@@ -18,7 +18,8 @@ FROM node:18-alpine AS api-builder
 
 WORKDIR /build/api
 COPY api/package.json ./
-RUN npm ci --omit=dev
+# npm install 会自动生成 lockfile，无需预先存在
+RUN npm install --omit=dev
 
 # ============================================
 # 阶段 3：最终运行镜像
@@ -30,17 +31,15 @@ LABEL org.opencontainers.image.description="FinanceMCP REST API for WidgetKit"
 
 WORKDIR /app
 
-# 拷贝 FinanceMCP 编译产物 + node_modules
 COPY --from=mcp-builder /build/finance-mcp /app/finance-mcp
 
-# 拷贝 API 包装层
 COPY --from=api-builder /build/api/node_modules /app/api/node_modules
 COPY api/package.json /app/api/
 COPY api/server.js /app/api/
 
 WORKDIR /app/api
 
-ENV TUSHARE_TOKEN=""
+# 不声明 TUSHARE_TOKEN，运行时由 docker-compose 注入
 ENV API_PORT=3100
 ENV NODE_ENV=production
 ENV NODE_OPTIONS="--max-old-space-size=512"
