@@ -1,0 +1,22 @@
+services:
+  finance-mcp:
+    image: ghcr.io/0Johny0/finance-mcp-api:latest
+    container_name: finance-mcp
+    restart: unless-stopped
+    ports:
+      - "3100:3100"
+    environment:
+      - TUSHARE_TOKEN=${TUSHARE_TOKEN}
+      - API_PORT=3100
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "0.5"
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
