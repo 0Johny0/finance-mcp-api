@@ -1,7 +1,6 @@
 const express = require("express");
 const { Client } = require("@modelcontextprotocol/sdk/client/index.js");
 const { StdioClientTransport } = require("@modelcontextprotocol/sdk/client/stdio.js");
-const { spawn } = require("child_process");
 
 const app = express();
 app.use(express.json());
@@ -16,25 +15,14 @@ function initMCP() {
   if (initPromise) return initPromise;
 
   initPromise = (async () => {
-    const financeProcess = spawn(
-      "node",
-      ["/app/finance-mcp/build/index.js"],
-      {
-        env: {
-          ...process.env,
-          TUSHARE_TOKEN: process.env.TUSHARE_TOKEN || "",
-        },
-        stdio: ["pipe", "pipe", "pipe"],
-      }
-    );
-
-    financeProcess.stderr.on("data", (d) =>
-      console.error("[FinanceMCP stderr]", d.toString())
-    );
-
+    // ✅ 新版 SDK 直接传 command + args，不再手动 spawn
     const transport = new StdioClientTransport({
-      stdin: financeProcess.stdin,
-      stdout: financeProcess.stdout,
+      command: "node",
+      args: ["/app/finance-mcp/build/index.js"],
+      env: {
+        ...process.env,
+        TUSHARE_TOKEN: process.env.TUSHARE_TOKEN || "",
+      },
     });
 
     mcpClient = new Client({
