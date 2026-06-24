@@ -1,76 +1,78 @@
 const express = require("express");
-const { Client } = require("@modelcontextprotocol/sdk/client/index.js");
-const { StdioClientTransport } = require("@modelcontextprotocol/sdk/client/stdio.js");
+const https = require("https");
 
 const app = express();
 app.use(express.json());
 
-let mcpClient = null;
-let initPromise = null;
-
 // ============================================================
-// 启动 MCP 子进程并建立连接
+// Yahoo Finance 数据获取
 // ============================================================
-function initMCP() {
-  if (initPromise) return initPromise;
+const SYMBOLS = {
+  dowJones: "^DJI",      // 道琼斯工业指数
+  nasdaq: "^IXIC",       // 纳斯达克综合指数
+  wtiCrude: "CL=F",      // WTI 原油期货
+};
 
-  initPromise = (async () => {
-    // ✅ 新版 SDK 直接传 command + args，不再手动 spawn
-    const transport = new StdioClientTransport({
-      command: "node",
-      args: ["/app/finance-mcp/build/index.js"],
-      env: {
-        ...process.env,
-        TUSHARE_TOKEN: process.env.TUSHARE_TOKEN || "",
-      },
-    });
+function fetchYahoo(symbol, range = "3mo", interval = "1d") {
+  return new Promise((resolve, reject) => {
+    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=${interval}&range=${range}`;
 
-    mcpClient = new Client({
-      name: "finance-api-wrapper",
-      version: "1.0.0",
-    });
-    await mcpClient.connect(transport);
+    https
+      .get(url, { headers: { "User-Agent": "Mozilla/5.0" } }, (res) => {
+        let data = "";
+        res.on("data", (chunk) => (data += chunk));
+        res.on("end", () => {
+          try {
+            const json = JSON.parse(data);
+            const result = json.chart?.result?.[0];
+            if (!result) return reject(new Error(`无数据: ${symbol}`));
 
-    const { tools } = await mcpClient.listTools();
-    console.log(
-      "✅ FinanceMCP 已连接，可用工具:",
-      tools.map((t) => t.name).join(", ")
-    );
-  })();
+            const meta = result.meta;
+            const timestamps = result.timestamp || [];
+            const quote = result.indicators?.quote?.[0] || {};
 
-  return initPromise;
-}
+            // 组装日线数据
+            const daily = timestamps
+              .map((ts, i) => ({
+                date: new Date(ts * 1000).toISOString().slice(0, 10),
+                open: quote.open?.[i],
+                high: quote.high?.[i],
+                low: quote.low?.[i],
+                close: quote.close?.[i],
+                volume: quote.volume?.[i],
+              }))
+              .filter((d) => d.close != null);
 
-// ============================================================
-// 通用 MCP 调用封装
-// ============================================================
-async function callFinanceTool(toolName, args = {}) {
-  await initMCP();
-  const result = await mcpClient.callTool({
-    name: toolName,
-    arguments: args,
+            // 最新行情摘要
+            const latest = daily[daily.length - 1];
+            const prev = daily.length >= 2 ? daily[daily.length - 2] : null;
+            const change = prev ? latest.close - prev.close : 0;
+            const changePercent = prev ? (change / prev.close) * 100 : 0;
+
+            resolve({
+              symbol,
+              name: meta.shortName || symbol,
+              currency: meta.currency,
+              latest: {
+                date: latest.date,
+                close: latest.close,
+                open: latest.open,
+                high: latest.high,
+                low: latest.low,
+                volume: latest.volume,
+                change: Math.round(change * 100) / 100,
+                changePercent: Math.round(changePercent * 100) / 100,
+                isUp: change >= 0,
+              },
+              history: daily,
+            });
+          } catch (e) {
+            reject(e);
+          }
+        });
+      })
+      .on("error", reject);
   });
-  const text = result.content?.[0]?.text;
-  try {
-    return JSON.parse(text);
-  } catch {
-    return { raw: text };
-  }
-}
-
-// ============================================================
-// 日期工具（默认最近 60 天）
-// ============================================================
-function fmt(d) {
-  return d.toISOString().slice(0, 10).replace(/-/g, "");
-}
-function defaultEnd() {
-  return fmt(new Date());
-}
-function defaultStart() {
-  const d = new Date();
-  d.setDate(d.getDate() - 60);
-  return fmt(d);
 }
 
 // ============================================================
@@ -78,83 +80,25 @@ function defaultStart() {
 // ============================================================
 
 // 健康检查
-app.get("/health", async (_req, res) => {
-  try {
-    const ts = await callFinanceTool("current_timestamp");
-    res.json({ status: "ok", timestamp: ts });
-  } catch (e) {
-    res.status(503).json({ status: "error", message: e.message });
-  }
+app.get("/health", (_req, res) => {
+  res.json({ status: "ok", timestamp: new Date().toISOString() });
 });
 
-// 指数数据
-// GET /api/index?code=DJI.GI&start_date=20260601&end_date=20260624
-app.get("/api/index", async (req, res) => {
+// 聚合看板（WidgetKit 主要调这个）
+// GET /api/dashboard?range=1mo
+app.get("/api/dashboard", async (req, res) => {
   try {
-    const { code, start_date, end_date } = req.query;
-    if (!code) return res.status(400).json({ error: "缺少 code 参数" });
-
-    const data = await callFinanceTool("index_data", {
-      code,
-      start_date: start_date || defaultStart(),
-      end_date: end_date || defaultEnd(),
-    });
-    res.json(data);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// 股票/期货数据
-// GET /api/stock?code=CL.NYM&market_type=futures&indicators=macd,rsi
-app.get("/api/stock", async (req, res) => {
-  try {
-    const { code, start_date, end_date, market_type, indicators } = req.query;
-    if (!code) return res.status(400).json({ error: "缺少 code 参数" });
-
-    const args = {
-      code,
-      start_date: start_date || defaultStart(),
-      end_date: end_date || defaultEnd(),
-    };
-    if (market_type) args.market_type = market_type;
-    if (indicators) args.indicators = indicators;
-
-    const data = await callFinanceTool("stock_data", args);
-    res.json(data);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// 聚合看板：道指 + 纳指 + WTI 一次返回
-// GET /api/dashboard
-app.get("/api/dashboard", async (_req, res) => {
-  try {
-    const start = defaultStart();
-    const end = defaultEnd();
+    const range = req.query.range || "3mo";
 
     const [dji, ixic, wti] = await Promise.all([
-      callFinanceTool("index_data", {
-        code: "DJI.GI",
-        start_date: start,
-        end_date: end,
-      }),
-      callFinanceTool("index_data", {
-        code: "IXIC.GI",
-        start_date: start,
-        end_date: end,
-      }),
-      callFinanceTool("stock_data", {
-        code: "CL.NYM",
-        market_type: "futures",
-        start_date: start,
-        end_date: end,
-      }),
+      fetchYahoo(SYMBOLS.dowJones, range),
+      fetchYahoo(SYMBOLS.nasdaq, range),
+      fetchYahoo(SYMBOLS.wtiCrude, range),
     ]);
 
     res.json({
       timestamp: new Date().toISOString(),
+      range,
       dowJones: dji,
       nasdaq: ixic,
       wtiCrude: wti,
@@ -164,22 +108,28 @@ app.get("/api/dashboard", async (_req, res) => {
   }
 });
 
+// 单品种查询
+// GET /api/quote?symbol=^DJI&range=1mo
+app.get("/api/quote", async (req, res) => {
+  try {
+    const { symbol, range } = req.query;
+    if (!symbol) return res.status(400).json({ error: "缺少 symbol 参数" });
+
+    const data = await fetchYahoo(symbol, range || "3mo");
+    res.json(data);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ============================================================
-// 启动服务
+// 启动
 // ============================================================
 const PORT = process.env.API_PORT || 3100;
 
-initMCP()
-  .then(() => {
-    app.listen(PORT, "0.0.0.0", () => {
-      console.log(`🚀 Finance REST API 已启动: http://0.0.0.0:${PORT}`);
-      console.log("   GET /health        - 健康检查");
-      console.log("   GET /api/index     - 指数数据");
-      console.log("   GET /api/stock     - 股票/期货数据");
-      console.log("   GET /api/dashboard - 聚合看板");
-    });
-  })
-  .catch((err) => {
-    console.error("❌ MCP 初始化失败:", err);
-    process.exit(1);
-  });
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`🚀 Market API 已启动: http://0.0.0.0:${PORT}`);
+  console.log("   GET /health        - 健康检查");
+  console.log("   GET /api/dashboard  - 道指+纳指+WTI 聚合");
+  console.log("   GET /api/quote?symbol=^DJI - 单品种查询");
+});
